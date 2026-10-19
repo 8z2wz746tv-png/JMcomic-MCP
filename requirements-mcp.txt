@@ -1,0 +1,8 @@
+# jmcomic_mcp 依赖
+#
+# 只给 MCP 层用，刻意不写进项目根的 pyproject.toml：
+# 上游声明 requires-python >= 3.7，而 mcp SDK 要求 >= 3.10，
+# 混在一起会破坏上游的版本兼容承诺。
+#
+# 装法： ./venv/bin/pip install -r requirements-mcp.txt
+mcp>=2.3,<3
