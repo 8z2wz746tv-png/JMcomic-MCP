@@ -1,0 +1,49 @@
+name: MCP 测试
+
+# 只跑离线用例（不联网、不写用户目录），提交即验证。
+# 上游那些测线上站点的 workflow 不在这里跑。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'jmcomic_mcp/**'
+      - 'src/**'
+      - 'run_mcp.sh'
+      - 'requirements-mcp.txt'
+      - 'pyproject.toml'
+      - '.github/workflows/mcp-tests.yml'
+  pull_request:
+    paths:
+      - 'jmcomic_mcp/**'
+      - 'src/**'
+      - '.github/workflows/mcp-tests.yml'
+  workflow_dispatch:
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 是 mcp SDK 的下限，3.13 是当前最新的稳定版
+        python-version: ['3.10', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装 jmcomic（含运行依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: 安装 MCP 依赖
+        run: pip install -r requirements-mcp.txt
+
+      - name: 跑离线用例
+        run: python -m unittest discover -s jmcomic_mcp/tests -t . -v

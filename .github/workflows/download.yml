@@ -1,12 +1,10 @@
 name: 下载JM本子 (commit)
 
+# 上游的 push 触发已移除：它会在改到下面三个文件时自动跑一次下载，
+# 而本仓库没有 JM_ALBUM_IDS / 登录 secrets，每次 push 都必然失败。
+# 需要时在 Actions 页面手动 Run workflow。
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/download.yml' # 工作流定义
-      - 'usage/workflow_download.py' # 下载脚本
-      - 'assets/option/option_workflow_download.yml' # 配置文件
 
 jobs:
   crawler:

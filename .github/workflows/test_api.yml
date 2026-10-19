@@ -1,8 +1,8 @@
 name: Run Test (API)
 
+# 上游的每日定时已移除：它测线上站点，本仓库没有对应 secrets，会天天红。
+# 需要时在 Actions 页面手动 Run workflow。
 on:
-  schedule:
-    - cron: "0 0 * * *"
   workflow_dispatch:
   push:
     branches: [ "dev" ]
