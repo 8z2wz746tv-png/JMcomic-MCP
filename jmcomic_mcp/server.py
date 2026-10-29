@@ -24,6 +24,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,14 @@ def _print_to_stderr(*args, **kwargs):
 
 if builtins.print is not _print_to_stderr:
     builtins.print = _print_to_stderr
+
+# Windows 控制台默认是 GBK，中文日志传出去就是乱码（宿主日志面板里全是问号）。
+# 强制 UTF-8：stdout 是 JSON-RPC 通道，本来就是 UTF-8；stderr 是日志。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,7 +73,9 @@ from jmcomic.jm_config import JmModuleConfig  # noqa: E402
 
 from jmcomic_mcp.tasks import (  # noqa: E402
     DEFAULT_DEST_DIR,
+    DEFAULT_IMAGE_THREADS,
     JmcomicMcpError,
+    MAX_IMAGE_THREADS,
     TaskManager,
     build_option,
     parse_targets,
@@ -96,21 +107,44 @@ manager = TaskManager()
 # 3. 只读工具
 # ---------------------------------------------------------------------------
 
-_client_cache: Dict[str, Any] = {}
+_client_cache: Dict[Any, Any] = {}
 _client_lock = threading.Lock()
+
+# 缓存过期时间。原来的缓存只看 config_file 路径、永不失效，结果是：
+# cookies 过期后 get_favorites 一直报错，用户去 option.yml 重填密码也没用
+# ——因为命中旧 client，login 插件根本没重新跑，只能重启宿主。
+# 现在 key 带上 (mtime, size) 且 30 分钟后强制重建，改配置或等到期都会重新登录。
+_CLIENT_TTL_SEC = 1800
+
+
+def _client_cache_key(config_file: str = ""):
+    """缓存 key：路径 + 文件 mtime/size。配置一改，旧 client 自然失效。"""
+    path = os.path.expanduser(config_file.strip()) if config_file else ""
+    if not path:
+        return ("", 0.0, 0)
+    try:
+        st = os.stat(path)
+    except OSError:
+        raise JmcomicMcpError(f"配置文件不存在: {path}")
+    return (path, st.st_mtime, st.st_size)
 
 
 def _client(config_file: str = ""):
-    """按 config_file 缓存 JmcomicClient（首次创建会去拉取最新域名）。"""
-    key = os.path.expanduser(config_file.strip()) if config_file else ""
+    """按 config_file 缓存 JmcomicClient（首次创建会去拉取最新域名/执行登录插件）。"""
+    key = _client_cache_key(config_file)
     with _client_lock:
-        client = _client_cache.get(key)
-        if client is None:
-            if key and not os.path.isfile(key):
-                raise JmcomicMcpError(f"配置文件不存在: {key}")
-            option = build_option(DEFAULT_DEST_DIR, config_file=key or None)
-            client = option.new_jm_client()
-            _client_cache[key] = client
+        now = time.monotonic()
+        hit = _client_cache.get(key)
+        if hit is not None and now - hit[0] < _CLIENT_TTL_SEC:
+            return hit[1]
+
+        option = build_option(DEFAULT_DEST_DIR, config_file=key[0] or None)
+        client = option.new_jm_client()
+
+        # 同一路径下的旧 key 清掉，免得改几次配置后缓存一直涨
+        for stale in [k for k in _client_cache if k[0] == key[0]]:
+            _client_cache.pop(stale, None)
+        _client_cache[key] = (now, client)
         return client
 
 
@@ -359,9 +393,12 @@ def start_download(album_ids: str = "",
     :param dest_dir: 下载根目录，必须是绝对路径（支持 ~）。留空用 ~/Downloads/JMComic。
                      该值**始终覆盖**配置文件里的 dir_rule.base_dir。
     :param image_suffix: 图片格式，如 '.png' / '.jpg'。留空保持原格式。
-    :param image_threads: 图片下载并发数（留空或 0 用 jmcomic 默认 30）
+    :param image_threads: 图片下载并发数（默认 8，上限 16）。别为了加速堆线程，
+                     多了会被站点限流，而且失败会被归因成 CDN 不可达。
     :param config_file: 可选的 option.yml 绝对路径（域名/代理/cookies/登录插件）
     :param confirmed: 用户是否已明确同意本次下载
+
+    同时最多只有 2 个任务在真正下载，其余排队（state 保持 pending）。
     """
     album_list, photo_list, unparsed = parse_targets(album_ids, photo_ids)
 
@@ -379,16 +416,29 @@ def start_download(album_ids: str = "",
     except JmcomicMcpError as e:
         return {"error": str(e)}
 
-    threads = int(image_threads) if image_threads else None
-    if threads is not None and threads < 1:
-        return {"error": f"image_threads 必须 >= 1，收到 {image_threads}"}
+    if image_threads:
+        try:
+            threads = int(image_threads)
+        except (TypeError, ValueError):
+            return {"error": f"image_threads 必须是整数，收到 {image_threads!r}"}
+        if threads < 1:
+            return {"error": f"image_threads 必须 >= 1，收到 {image_threads}"}
+        if threads > MAX_IMAGE_THREADS:
+            return {
+                "error": f"image_threads 最多 {MAX_IMAGE_THREADS}，收到 {threads}",
+                "hint": ("并发拉太高会被站点限流，失败又会被归因成 image_cdn_unreachable，"
+                         "反而查不出真正原因。真要加速请拆成多个 album 而不是堆线程。"),
+            }
+    else:
+        # 显式落地成 8，不传就是 8；不再让 jmcomic 用它的默认 30
+        threads = DEFAULT_IMAGE_THREADS
 
     plan = {
         "albums": album_list,
         "photos": photo_list,
         "dest_dir": resolved_dest,
         "image_suffix": image_suffix or "保持原格式",
-        "image_threads": threads or "jmcomic 默认(30)",
+        "image_threads": threads,
         "config_file": os.path.expanduser(config_file) if config_file else "默认配置",
         "total_targets": len(album_list) + len(photo_list),
     }

@@ -64,6 +64,14 @@ DEFAULT_DEST_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "JMComic")
 MAX_HISTORY = 50
 ERROR_MAX_LEN = 600
 
+# 并发闸门：单任务图片线程上限 + 同时运行的任务数上限。
+# 不加这道闸，模型连着发三个 start_download 就是 3 × 30 = 90 个并发请求打同一个
+# CDN，被站点限流后 classify_failure 只会报 image_cdn_unreachable（因为它查了
+# DNS，域名是好的），把用户引去换 DNS 开代理 —— 那是误诊。
+DEFAULT_IMAGE_THREADS = 8   # 不传 image_threads 时用它，替掉 jmcomic 默认的 30
+MAX_IMAGE_THREADS = 16
+DEFAULT_MAX_CONCURRENT_TASKS = 2
+
 
 class JmcomicMcpError(Exception):
     """参数校验失败等可直接展示给调用方的错误。"""
@@ -199,6 +207,7 @@ def parse_targets(album_text: Optional[str],
     album_ids: List[Tuple[str, str]] = []
     photo_ids: List[Tuple[str, str]] = []
     bad: List[str] = []
+    seen: Dict[str, set] = {KIND_ALBUM: set(), KIND_PHOTO: set()}
 
     for want_photo, text in ((False, album_text), (True, photo_text)):
         for piece in _iter_tokens(text):
@@ -212,6 +221,11 @@ def parse_targets(album_text: Optional[str],
             except Exception:
                 bad.append(piece)
                 continue
+            # 同一个框里重复粘贴也要去重，否则同一章会排两次、
+            # photos_total 虚高、还多跑一轮请求
+            if jmid in seen[kind]:
+                continue
+            seen[kind].add(jmid)
             (photo_ids if is_photo else album_ids).append((kind, jmid))
 
     # 同一个号不要下两次
@@ -223,12 +237,57 @@ def parse_targets(album_text: Optional[str],
     )
 
 
+def _blocked_roots() -> List[str]:
+    """不该往里拉本子的目录：盘符根、系统目录、家目录本身、AppData。"""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        drive = os.environ.get("SystemDrive") or "C:"
+        return [
+            os.path.join(drive + os.sep, "Windows"),
+            os.path.join(drive + os.sep, "Program Files"),
+            os.path.join(drive + os.sep, "Program Files (x86)"),
+            os.path.join(drive + os.sep, "ProgramData"),
+            os.path.join(home, "AppData"),
+        ]
+    return ["/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys",
+            "/System", "/Library", "/Applications"]
+
+
+def _under(path: str, parent: str) -> bool:
+    # Windows 上路径大小写不敏感，commonpath 的结果却保留调用方的大小写，
+    # 直接比对会让 'c:\windows\temp' 绕过 'C:\Windows' 的拦截，所以先 normcase。
+    try:
+        return (os.path.normcase(os.path.commonpath([path, parent]))
+                == os.path.normcase(os.path.abspath(parent)))
+    except (ValueError, OSError):
+        return False
+
+
+def reason_for_rejecting_dest(path: str) -> Optional[str]:
+    """
+    判断一个已规范化的绝对路径能不能当下载根目录。
+
+    :return: 不能用的理由；能用则返回 None
+    """
+    if os.path.dirname(path) == path:
+        return "指向磁盘根目录"
+    if os.path.normcase(path) == os.path.normcase(os.path.expanduser("~")):
+        return "指向用户主目录本身（会把文件散在家目录里），改用它的子目录"
+    for root in _blocked_roots():
+        if _under(path, root):
+            return f"落在系统目录 {root} 内"
+    return None
+
+
 def resolve_dest_dir(dest_dir: Optional[str]) -> str:
     """
     把下载目录解析成绝对路径。
 
     刻意拒绝相对路径：MCP server 的 cwd 由宿主决定，相对路径会让文件落到
     不可预期的位置。支持 '~' 展开。
+
+    也拒绝磁盘根、系统目录、家目录本身：dest_dir 是模型可控参数，
+    没有白名单的话一次 typo 就能把一本 200 页的本子摊在 D:\\ 根目录。
     """
     if not dest_dir:
         return DEFAULT_DEST_DIR
@@ -240,7 +299,15 @@ def resolve_dest_dir(dest_dir: Optional[str]) -> str:
             f"建议使用 {DEFAULT_DEST_DIR}"
         )
 
-    return os.path.abspath(expanded)
+    resolved = os.path.abspath(expanded)
+    reason = reason_for_rejecting_dest(resolved)
+    if reason:
+        raise JmcomicMcpError(
+            f"下载目录不能是 {resolved}：{reason}。"
+            f"请给它一个专门的子目录，例如 {DEFAULT_DEST_DIR}"
+        )
+
+    return resolved
 
 
 def build_option(dest_dir: str,
@@ -554,10 +621,30 @@ class DownloadTask:
 class TaskManager:
     """进程内任务表。MCP server 是单进程长驻，所以内存态即可。"""
 
-    def __init__(self, max_history: int = MAX_HISTORY) -> None:
+    def __init__(self,
+                 max_history: int = MAX_HISTORY,
+                 max_concurrent: int = DEFAULT_MAX_CONCURRENT_TASKS,
+                 ) -> None:
         self._tasks: "OrderedDict[str, DownloadTask]" = OrderedDict()
         self._lock = threading.Lock()
         self._max_history = max_history
+        # 同时在跑的任务数上限。0 或负数表示不限（测试/自建场景用）。
+        self._max_concurrent = int(max_concurrent)
+        self._slots = threading.BoundedSemaphore(max(1, self._max_concurrent))
+
+    def _acquire_slot(self, task: DownloadTask) -> bool:
+        """
+        抢一个并发槽位。排队期间任务保持 pending 状态，取消能立刻生效。
+
+        :return: True=拿到槽位；False=排队时被取消
+        """
+        if self._max_concurrent <= 0:
+            return True
+        task.set_current("排队中：等待并发下载槽位")
+        while not task.cancel_event.is_set():
+            if self._slots.acquire(timeout=0.2):
+                return True
+        return False
 
     def submit(self,
                album_ids: Sequence[str],
@@ -623,8 +710,17 @@ class TaskManager:
     # ---------- 工作线程 ----------
 
     def _run(self, task: DownloadTask) -> None:
-        task.mark_running()
+        acquired = False
         try:
+            # 先抢并发槽位，再进入 running —— 排队中的任务 state 保持 pending，
+            # 这样 get_task 不会在还没开始下载时就谎报"下载中"。
+            acquired = self._acquire_slot(task)
+            if not acquired:
+                task.mark(STATE_CANCELLED, error_kind=ERROR_CANCELLED,
+                          error_hint="任务在排队等待并发槽位时被取消。")
+                return
+
+            task.mark_running()
             option = build_option(
                 task.dest_dir,
                 image_suffix=task.image_suffix,
@@ -650,8 +746,9 @@ class TaskManager:
                         dler.download_album(jmid)
                         task.count_album_done()
                     else:
+                        # 章节不计入 albums_done —— 曾经这里也调了 count_album_done，
+                        # 导致 albums 字段出现 "3/1" 这种自相矛盾的进度
                         dler.download_photo(jmid)
-                        task.count_album_done()
 
                 if task.cancel_event.is_set():
                     task.mark(STATE_CANCELLED, error_kind=ERROR_CANCELLED,
@@ -670,6 +767,8 @@ class TaskManager:
             )
             task.mark(state, error=f"{type(e).__name__}: {e}", error_kind=kind, error_hint=hint)
         finally:
+            if acquired:
+                self._slots.release()
             task.finished_at = time.time()
             task._downloader = None
             try:

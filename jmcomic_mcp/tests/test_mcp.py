@@ -52,6 +52,13 @@ class TestParseTargets(unittest.TestCase):
         self.assertEqual(albums, ["422866"])
         self.assertEqual(photos, [])
 
+    def test_duplicate_inside_same_box_deduped(self):
+        # 重复粘贴同一批号：不去重就会排两次、photos_total 虚高、多跑一轮请求
+        albums, _, _ = T.parse_targets("422866 422866 JM422866", "")
+        self.assertEqual(albums, ["422866"])
+        _, photos, _ = T.parse_targets("", "456 456 p456 789")
+        self.assertEqual(photos, ["456", "789"])
+
 
 class TestDestDir(unittest.TestCase):
 
@@ -68,6 +75,25 @@ class TestDestDir(unittest.TestCase):
     def test_relative_rejected(self):
         with self.assertRaises(T.JmcomicMcpError):
             T.resolve_dest_dir("downloads/jm")
+
+    def test_filesystem_root_rejected(self):
+        with self.assertRaises(T.JmcomicMcpError):
+            T.resolve_dest_dir(os.path.abspath(os.sep))
+
+    def test_home_itself_rejected(self):
+        with self.assertRaises(T.JmcomicMcpError):
+            T.resolve_dest_dir("~")
+
+    def test_nested_dest_under_home_allowed(self):
+        got = T.resolve_dest_dir("~/Downloads/JMComic")
+        self.assertEqual(got, os.path.join(os.path.expanduser("~"), "Downloads", "JMComic"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows 路径大小写不敏感")
+    def test_system_dir_rejected_case_insensitively(self):
+        lowered = os.path.join(os.environ.get("SystemDrive", "C:") + os.sep,
+                               "windows", "temp", "jm")
+        with self.assertRaises(T.JmcomicMcpError):
+            T.resolve_dest_dir(lowered)
 
 
 class TestBuildOption(unittest.TestCase):
@@ -211,6 +237,59 @@ class TestTaskManager(unittest.TestCase):
     def test_unknown_task(self):
         self.assertIsNone(T.TaskManager().get("nope"))
         self.assertIsNone(T.TaskManager().cancel("nope"))
+
+    def test_photo_target_does_not_count_album(self):
+        # 回归：章节分支曾经误调 count_album_done()，进度会冒出 "3/1"
+        T._CancellableDownloader = _FakeFactory()
+        manager = T.TaskManager()
+        task = manager.submit([], ["456", "789"], dest_dir=self._tmp_dir())
+        snap = self._wait(task)
+        self.assertEqual(snap["state"], T.STATE_SUCCEEDED, snap)
+        self.assertIsNone(snap["albums"], snap["albums"])
+        self.assertEqual(task.albums_done, 0)
+
+    def test_mixed_targets_album_count_not_inflated(self):
+        T._CancellableDownloader = _FakeFactory()
+        manager = T.TaskManager()
+        task = manager.submit(["422866"], ["456", "789"], dest_dir=self._tmp_dir())
+        snap = self._wait(task)
+        self.assertEqual(snap["albums"], "1/1", snap["albums"])
+
+    def test_concurrent_slots_queue_second_task(self):
+        T._CancellableDownloader = _FakeFactory()
+        manager = T.TaskManager(max_concurrent=1)
+        dest = self._tmp_dir()
+        first = manager.submit(["111"], [], dest_dir=dest)
+        second = manager.submit(["222"], [], dest_dir=dest)
+        time.sleep(0.1)
+        queued = second.snapshot()
+        self.assertEqual(queued["state"], T.STATE_PENDING, queued["state"])
+        self.assertIn("排队", queued["current"] or "")
+        self.assertEqual(self._wait(first)["state"], T.STATE_SUCCEEDED)
+        self.assertEqual(self._wait(second)["state"], T.STATE_SUCCEEDED)
+
+    def test_cancel_while_queued(self):
+        T._CancellableDownloader = _FakeFactory()
+        manager = T.TaskManager(max_concurrent=1)
+        dest = self._tmp_dir()
+        first = manager.submit(["111"], [], dest_dir=dest)
+        second = manager.submit(["222"], [], dest_dir=dest)
+        time.sleep(0.05)
+        manager.cancel(second.task_id)
+        self._wait(first)
+        self.assertEqual(self._wait(second)["state"], T.STATE_CANCELLED)
+        self.assertEqual(second.albums_total, 0, "排队中被取消的任务不该真的开始下载")
+
+    def test_slot_released_after_failure(self):
+        T._CancellableDownloader = _FakeFactory(fail=True)
+        manager = T.TaskManager(max_concurrent=1)
+        dest = self._tmp_dir()
+        first = manager.submit(["111"], [], dest_dir=dest)
+        self.assertEqual(self._wait(first)["state"], T.STATE_PARTIAL)
+        T._CancellableDownloader = _FakeFactory()
+        second = manager.submit(["222"], [], dest_dir=dest)
+        self.assertEqual(self._wait(second)["state"], T.STATE_SUCCEEDED,
+                         "失败任务必须释放槽位，否则后面的任务永远排队")
 
 
 class TestProgressAccounting(unittest.TestCase):
@@ -487,6 +566,20 @@ class TestServerTools(unittest.TestCase):
 
     def test_start_download_bad_threads(self):
         got = self.S.start_download(album_ids="422866", image_threads=-1, confirmed=True)
+        self.assertIn("error", got)
+
+    def test_start_download_threads_capped(self):
+        got = self.S.start_download(album_ids="422866", image_threads=99)
+        self.assertIn("error", got)
+        self.assertIn(str(self.S.MAX_IMAGE_THREADS), got["error"])
+
+    def test_start_download_default_threads(self):
+        # 不传 image_threads 时落到 8，不再让 jmcomic 用它的默认 30
+        got = self.S.start_download(album_ids="422866")
+        self.assertEqual(got["plan"]["image_threads"], self.S.DEFAULT_IMAGE_THREADS)
+
+    def test_start_download_root_dir_rejected(self):
+        got = self.S.start_download(album_ids="422866", dest_dir=os.path.abspath(os.sep))
         self.assertIn("error", got)
 
     def test_get_task_unknown(self):

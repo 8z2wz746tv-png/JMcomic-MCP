@@ -12,8 +12,12 @@
 ## 1. 安装
 
 ```bash
+# Linux / macOS
 ./venv/bin/pip install -r requirements-mcp.txt   # 只装 mcp SDK
 chmod +x run_mcp.sh
+
+# Windows
+venv\Scripts\pip install -r requirements-mcp.txt
 ```
 
 > `mcp` 依赖**没有**写进 `pyproject.toml`：上游声明 `requires-python >= 3.7`，
@@ -48,6 +52,29 @@ chmod +x run_mcp.sh
   }
 }
 ```
+
+### Windows
+
+**不要配 `run_mcp.sh`。** 那是 bash 脚本，Windows 宿主执行不了，表现是一直
+显示"正在连接"然后断开。用仓库根目录的 `run_mcp.bat`，或者直接指解释器：
+
+```json
+{
+  "mcpServers": {
+    "jmcomic": {
+      "command": "D:/project/JMcomic-MCP/venv/Scripts/python.exe",
+      "args": ["D:/project/JMcomic-MCP/jmcomic_mcp/server.py"]
+    }
+  }
+}
+```
+
+用 `run_mcp.bat` 的话写 `"command": "D:/project/JMcomic-MCP/run_mcp.bat"` 即可，
+它会自己检查 venv 和 `mcp` 依赖有没有装好，缺了就把原因打到 stderr。
+
+> WorkBuddy 会往 stdio 子进程环境里注入自己的代理变量。如果启动卡在
+> "Still connecting"，在 `mcpServers` 里补一段空代理配置：
+> `"env": {"http_proxy": "", "https_proxy": "", "NO_PROXY": "*"}`。
 
 ## 3. 工具清单
 
@@ -145,16 +172,36 @@ jmcomic 会跳过已存在的图、不调 after_image，所以 `images` 显示 `
 DNS 那一档是**真去查一次**再下结论的（`socket.getaddrinfo`），不是猜：
 219 张全挂那次就是靠它定位到 CDN 域名被解析成 `0.0.0.0`。
 
+> **`image_cdn_unreachable` 会被并发掩盖。** 域名能解析、连接却失败，也可能是
+> 自己并发开太高被站点限流了。看到这一档先确认是不是同时跑了多个任务、
+> `image_threads` 是不是被调到十几以上，再怀疑网络。
+
 ## 5. 下载目录与登录态
 
 ### 下载目录
 
-默认 `~/Downloads/JMComic`。**必须传绝对路径**（支持 `~`），相对路径会被拒绝——
-MCP server 的 cwd 由宿主决定，相对路径会让文件落到不可预期的位置。
+默认 `~/Downloads/JMComic`。三条硬规则：
 
-这个参数**始终覆盖**配置文件里的 `dir_rule.base_dir`。项目根目录里那堆本子就是
+1. **必须是绝对路径**（支持 `~`）。相对路径会被拒绝——MCP server 的 cwd 由宿主
+   决定，相对路径会让文件落到不可预期的位置。
+2. **不能是磁盘根**（`D:\`、`/`）、**不能是用户主目录本身**、**不能落在系统目录**
+   （`C:\Windows`、`C:\Program Files`、`~/AppData`、`/etc`、`/usr` 等）。
+   `dest_dir` 是模型可控参数，没有白名单的话一次 typo 就能把一本 200 页的本子
+   摊在 `D:\` 根目录；要清理只能靠 `created_dirs`，前提是你先知道这事发生过。
+3. 这个参数**始终覆盖**配置文件里的 `dir_rule.base_dir`。项目根目录里那堆本子就是
 旧 GUI 漏了这一步造成的（当时下载目录只用来建空文件夹，从没写进 option，
 jmcomic 于是用了 `os.getcwd()`）。
+
+### 并发闸门
+
+两道闸，都是为了别把站点打到限流：
+
+- `image_threads` 默认 **8**（不再用 jmcomic 的 30），上限 **16**，超了直接报错；
+- 同时**最多 2 个任务在真正下载**，其余排队（`state` 保持 `pending`、
+  `current` 显示「排队中：等待并发下载槽位」），排队期间取消立即生效。
+
+要更快就拆成多次调用让它们排队，别堆线程——堆线程只会让失败原因变成
+`image_cdn_unreachable`，把自己引去换 DNS 开代理，查不出真原因。
 
 ### 登录态（收藏夹要用）
 
@@ -174,22 +221,32 @@ plugins:
 `search_album`、`start_download` 等都支持）。客户端配置、代理、自定义域名
 也都可以写在这个文件里。
 
+client 按 `(路径, mtime, 大小)` 缓存，**改了这个文件就会重新登录**；即使不改，
+缓存 30 分钟也会过期重建。所以 cookie 失效后不用重启宿主，重新调一次即可
+（第一次会慢一点，它在重新登录）。
+
+> `config_file` 接受任意绝对路径，而 jmcomic 的 option.yml 支持插件机制
+> （能 import 并执行 Python）。这个参数是模型可控的，别让它指向来路不明的
+> 配置文件——等于把代码执行面交出去。
+
 ## 6. 排错
 
 - **日志全在 stderr**。stdio 模式下 stdout 是 JSON-RPC 通道，jmcomic 自带日志
   默认走 `print()`（`jm_config.default_jm_logging`），漏一行就会把宿主连接打断。
   `server.py` 在导入第三方模块前就把 `builtins.print` 和 jmcomic 的日志执行器
   都掰到了 stderr，并有专门的回归测试盯着这件事。
-- 启动失败先手动跑一次看报错：`./run_mcp.sh`（它不该输出任何正常内容，
-  只会有 stderr 日志）。
+- 启动失败先手动跑一次看报错：`./run_mcp.sh` / `run_mcp.bat`（它不该输出任何
+  正常内容，只会有 stderr 日志）。
 - 域名失效：jmcomic 会自己去拉最新域名；实在不行在 `config_file` 里写死
   `client.domain`。
-- 任务历史只存在内存里，server 重启后 `get_task` 找不到旧任务。
+- 任务历史只存在内存里，server 重启后 `get_task` 找不到旧任务。**重启不影响
+  磁盘上已下好的文件**，重下会自动跳过（看 `skipped_existing`，不是失败）。
 
 ## 7. 自测
 
 ```bash
-# 离线：31 个用例（参数解析、确认门、任务生命周期、取消、进度口径、stdio 协议）
+# 离线：61 个用例（参数解析、确认门、任务生命周期、取消、进度口径、
+#      并发排队、缓存失效、dest_dir 校验、stdio 协议）
 ./venv/bin/python -m unittest discover -s jmcomic_mcp/tests -t .
 
 # 联网：只读工具 + 下载路径端到端（dry run，不下载任何图片）
@@ -207,8 +264,8 @@ plugins:
 的副本（版本 2.6.9），**未经修改**，按 MIT 许可随附；原项目的 README 保留在
 [README.upstream.md](./README.upstream.md)。
 
-`jmcomic_mcp/`、`run_mcp.sh`、`requirements-mcp.txt` 及本 README 是在其之上的
-MCP 封装层，同样遵循 MIT。上游版权归原作者所有。
+`jmcomic_mcp/`、`run_mcp.sh`、`run_mcp.bat`、`requirements-mcp.txt` 及本 README
+是在其之上的 MCP 封装层，同样遵循 MIT。上游版权归原作者所有。
 
 本工具仅用于个人用途。它抓取的是第三方站点、内容版权归原权利人，请自行
 确认所在地区的合法性；上游 README 也写了「为了减轻站点服务器压力，请不要

@@ -3,6 +3,8 @@
 
 from .tasks import (  # noqa: F401
     DEFAULT_DEST_DIR,
+    DEFAULT_IMAGE_THREADS,
+    MAX_IMAGE_THREADS,
     DownloadTask,
     JmcomicMcpError,
     TaskManager,
@@ -13,6 +15,8 @@ from .tasks import (  # noqa: F401
 
 __all__ = [
     "DEFAULT_DEST_DIR",
+    "DEFAULT_IMAGE_THREADS",
+    "MAX_IMAGE_THREADS",
     "DownloadTask",
     "JmcomicMcpError",
     "TaskManager",
